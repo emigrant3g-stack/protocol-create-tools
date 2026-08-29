@@ -612,6 +612,8 @@ def main():
     ap.add_argument("--url", default=os.environ.get("PROTOKOL_URL", ""), help="URL веб-приложения Google Apps Script")
     ap.add_argument("--secret", default=os.environ.get("PROTOKOL_SECRET", ""), help="секрет шлюза")
     ap.add_argument("--name", default="", help="pull: имя файла в облаке")
+    ap.add_argument("--index", type=int, default=0,
+                    help="pull: номер файла по списку команды list")
     ap.add_argument("--tpl", default=TPL_NAME)
     ap.add_argument("--out")
     ap.add_argument("--date")
@@ -626,15 +628,29 @@ def main():
             if a.cmd == "list":
                 r = cloud(a.url, a.secret)
                 if not r.get("ok"): print("ОШИБКА:", r.get("error")); return
-                for x in r["files"]:
-                    print(f"{x['name']}   изменён {x['updated'][:10]}")
+                if not r["files"]:
+                    print("В облаке пока нет протоколов."); return
+                w = max(len(x["name"]) for x in r["files"])
+                for i, x in enumerate(r["files"], start=1):
+                    d = x["updated"][:10].split("-")
+                    print(f"{i:>2}. {x['name']:<{w}}   изменён {d[2]}.{d[1]}.{d[0]}")
+                print("\nСкажите «работаем с N» — загружу протокол под этим номером.")
                 return
             if a.cmd == "pull":
+                if a.index:
+                    r = cloud(a.url, a.secret)
+                    if not r.get("ok"): print("ОШИБКА:", r.get("error")); return
+                    fs = r["files"]
+                    if not 1 <= a.index <= len(fs):
+                        print(f"НЕТ ТАКОГО НОМЕРА: в списке {len(fs)} протоколов"); return
+                    a.name = fs[a.index - 1]["name"]
                 name = a.name or a.file
                 r = cloud(a.url, a.secret, params={"name": name})
                 if not r.get("ok"): print("ОШИБКА:", r.get("error")); return
                 open(name, "w", encoding="utf-8").write(r["content"])
+                h, _ = parse(name)
                 print(f"✔ загружен из облака: {name}")
+                print(f"   {h['title']} · редакция {h['date']}")
                 return
             body = open(a.file, encoding="utf-8").read()
             r = cloud(a.url, a.secret, "POST",
