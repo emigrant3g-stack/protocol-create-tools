@@ -262,8 +262,12 @@ def parse(path):
                     i += 1
                 nodes.append(dict(num=num, kind="item" if otv is not None else "sect",
                                   mark=mark, text=rest.strip(), otv=otv, srok=srok))
-            elif line and not re.match(r"^\d", line) and not nodes:
-                head["block"] = line
+            elif line and not line.startswith("Ответственный:"):
+                if nodes:
+                    nodes.append(dict(num="", kind="head", mark=1, text=line,
+                                      otv=None, srok=None))
+                else:
+                    head["block"] = line
             i += 1
     return head, nodes
 
@@ -292,12 +296,15 @@ def label(n):
 def renumber(nodes):
     """Сквозная перенумерация. Подпункты едут вместе с родителем.
     Возвращает (новые узлы, таблица соответствия старый→новый)."""
-    groups, index = [], {}
+    groups, index, pending = [], {}, []
     for n in nodes:
+        if n["kind"] == "head":
+            pending.append(n); continue
         top = n["num"].split(".")[0]
         if top not in index:
             index[top] = len(groups)
-            groups.append({"top": top, "head": None, "subs": []})
+            groups.append({"top": top, "head": None, "subs": [], "pre": pending})
+            pending = []
         g = groups[index[top]]
         if "." in n["num"]:
             g["subs"].append(n)
@@ -305,6 +312,7 @@ def renumber(nodes):
             g["head"] = n
     out, mapping = [], []
     for i, g in enumerate(groups, start=1):
+        out += g.get("pre", [])
         if g["head"]:
             old = g["head"]["num"]
             g["head"] = dict(g["head"], num=str(i))
@@ -333,6 +341,8 @@ def show(head, nodes, marks, full=True):
     out.append("")
     if head["block"]: out += [head["block"], ""]
     for n, mk in zip(nodes, marks):
+        if n["kind"] == "head":
+            out += [n["text"], ""]; continue
         pre = (label(mk) + " ") if mk > 1 else ""
         body = pre + n["text"]
         if not full:
@@ -367,6 +377,8 @@ def to_md(head, nodes, marks, today):
     out += ["", "```"]
     if head["block"]: out += [head["block"], ""]
     for n, mk in zip(nodes, marks):
+        if n["kind"] == "head":
+            out += [n["text"], ""]; continue
         pre = (label(mk) + " ") if mk > 1 else ""
         out.append(f"{n['num']}. {pre}{n['text']}")
         if n["kind"] == "item":
@@ -420,6 +432,9 @@ def to_docx(head, nodes, marks, tpl, out_path, today):
 
     a = ITEM._element
     for n, mk in zip(nodes, marks):
+        if n["kind"] == "head":
+            e = copy.deepcopy(HEAD._element); a.addnext(e); a = e
+            put(Paragraph(e, par), n["text"]); continue
         lvl = 1 if "." in n["num"] else 0
         tpl_p = SECT if n["kind"] == "sect" else (SUB if lvl else ITEM)
         e = copy.deepcopy(tpl_p._element); a.addnext(e); a = e
@@ -441,7 +456,7 @@ def to_docx(head, nodes, marks, tpl, out_path, today):
     else:
         HEAD._element.getparent().remove(HEAD._element)
 
-    put(TITLE, head["title"].split(". ", 1)[-1].upper())
+    put(TITLE, re.sub(r"^\d+\.\s*", "", head["title"]).upper())
     put(DATE, f"Дата последней редакции: {today:%d.%m.%Y}")
     put(PLACE, head["place"])
     d.save(out_path)
@@ -452,6 +467,7 @@ def check(head, nodes):
     """Структурные аномалии. Список строк; пусто — всё в порядке."""
     out = []
     tops = {}
+    nodes = [n for n in nodes if n["kind"] != "head"]
     for n in nodes:
         top = n["num"].split(".")[0]
         tops.setdefault(top, {"head": None, "subs": []})
@@ -513,6 +529,7 @@ def merge(files, today):
 def used_numbers(head, nodes):
     used = set()
     for n in nodes:
+        if n["kind"] == "head": continue
         used.add(int(n["num"].split(".")[0]))
     for x in re.findall(r"\d+", head.get("deleted", "") or ""):
         used.add(int(x))
@@ -554,6 +571,8 @@ def write(path, head, nodes, today, keep_date=True):
     out += ["", "```"]
     if head.get("block"): out += [head["block"], ""]
     for n in nodes:
+        if n["kind"] == "head":
+            out += [n["text"], ""]; continue
         pre = (label(n["mark"]) + " ") if n["mark"] > 1 else ""
         out.append(f"{n['num']}. {pre}{n['text']}")
         if n["kind"] == "item":
@@ -686,7 +705,7 @@ def main():
             d = [x for x in re.findall(r"\d+", head.get("deleted", "") or "")]
             head["deleted"] = ", ".join(sorted(set(d + [str(top)]), key=int))
         write(a.file, head, nodes, today)
-        left = ", ".join(n["num"] for n in nodes)
+        left = ", ".join(n["num"] for n in nodes if n["kind"] != "head")
         msg = f"− {a.num} удалён · без изменений: {left}"
         journal(a.file, msg)
         print("✔ " + msg)
