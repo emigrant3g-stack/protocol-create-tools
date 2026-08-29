@@ -11,6 +11,11 @@ protokol.py — разбор и сборка протоколов совещан
     python protokol.py print   <протокол.md>  [--tpl шаблон.docx]
     python protokol.py renum   <протокол.md>  --out <протокол.md>
 
+Облако (Google Диск через Apps Script), URL и секрет — из инструкций проекта:
+    python protokol.py list  --url … --secret …
+    python protokol.py pull  --name <протокол.md> --url … --secret …
+    python protokol.py push  <протокол.md>        --url … --secret …
+
 Если на совещании переносили сроки — перечислить эти номера:
     python protokol.py print <протокол.md> --moved 7,9.1
 
@@ -51,6 +56,20 @@ def ensure_tpl(path):
     except Exception as e:
         sys.stderr.write(f"шаблон недоступен ({e.__class__.__name__}); приложите {TPL_NAME}\n")
         return None
+
+# ---------- облако ----------
+def cloud(url, secret, method="GET", payload=None, params=None, timeout=25):
+    import json
+    if method == "GET":
+        q = urllib.parse.urlencode(dict(params or {}, secret=secret))
+        req = urllib.request.Request(url + "?" + q)
+    else:
+        data = json.dumps(dict(payload or {}, secret=secret)).encode("utf-8")
+        req = urllib.request.Request(url, data=data,
+                                     headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8"))
+
 
 # ---------- модель ----------
 # узел: dict(num, kind, mark, text, otv, srok)
@@ -421,8 +440,24 @@ def next_sub(nodes, parent):
     return (max(subs) + 1) if subs else 1
 
 
+BAK = ".protokol_bak"
+JRN = ".protokol_journal"
+
+
+def journal(path, line):
+    with open(JRN, "a", encoding="utf-8") as j:
+        j.write(line.rstrip() + "\n")
+
+
+def backup(path):
+    """Сохранить текущую версию файла перед изменением (для undo)."""
+    if os.path.exists(path):
+        open(BAK, "w", encoding="utf-8").write(open(path, encoding="utf-8").read())
+
+
 def write(path, head, nodes, today, keep_date=True):
     """Записать файл, не трогая дату последней редакции (её ставит finish/md)."""
+    backup(path)
     d = head.get("date") or f"{today:%d.%m.%Y}"
     out = [f"# {head['title']}", "", f"Дата последней редакции: {d}", head["place"]]
     if head.get("deleted"): out.append(f"Удалённые номера: {head['deleted']}")
@@ -452,7 +487,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("cmd", choices=["show", "short", "people", "md", "print",
                                     "renum", "check", "finish", "new", "merge",
-                                    "add", "set", "del"])
+                                    "add", "set", "del", "head", "undo", "changes", "fix",
+                                    "push", "pull", "list"])
     ap.add_argument("file", nargs="?", help="файл протокола .md (любое имя)")
     ap.add_argument("--files", nargs="*", default=[], help="для merge: список файлов протоколов")
     ap.add_argument("--title", default=""); ap.add_argument("--place", default="")
@@ -461,6 +497,12 @@ def main():
     ap.add_argument("--parent", default="", help="номер родителя для add: подпункт")
     ap.add_argument("--text", default=""); ap.add_argument("--otv", default="")
     ap.add_argument("--srok", default=""); ap.add_argument("--section", default="")
+    ap.add_argument("--promote", default="", help="fix: вынести подпункт N.M в самостоятельный пункт")
+    ap.add_argument("--to-section", dest="to_section", default="", help="fix: сделать пункт разделом-заголовком")
+    ap.add_argument("--to-item", dest="to_item", default="", help="fix: сделать раздел пунктом (нужны --otv --srok)")
+    ap.add_argument("--url", default=os.environ.get("PROTOKOL_URL", ""), help="URL веб-приложения Google Apps Script")
+    ap.add_argument("--secret", default=os.environ.get("PROTOKOL_SECRET", ""), help="секрет шлюза")
+    ap.add_argument("--name", default="", help="pull: имя файла в облаке")
     ap.add_argument("--tpl", default=TPL_NAME)
     ap.add_argument("--out")
     ap.add_argument("--date")
@@ -468,6 +510,33 @@ def main():
     a = ap.parse_args()
     today = (datetime.datetime.strptime(a.date, "%d.%m.%Y").date() if a.date
              else datetime.date.today())
+    if a.cmd in ("push", "pull", "list"):
+        if not a.url or not a.secret:
+            print("НЕТ ДОСТУПА К ОБЛАКУ: нужны --url и --secret из инструкций проекта"); return
+        try:
+            if a.cmd == "list":
+                r = cloud(a.url, a.secret)
+                if not r.get("ok"): print("ОШИБКА:", r.get("error")); return
+                for x in r["files"]:
+                    print(f"{x['name']}   изменён {x['updated'][:10]}")
+                return
+            if a.cmd == "pull":
+                name = a.name or a.file
+                r = cloud(a.url, a.secret, params={"name": name})
+                if not r.get("ok"): print("ОШИБКА:", r.get("error")); return
+                open(name, "w", encoding="utf-8").write(r["content"])
+                print(f"✔ загружен из облака: {name}")
+                return
+            body = open(a.file, encoding="utf-8").read()
+            r = cloud(a.url, a.secret, "POST",
+                      {"name": os.path.basename(a.file), "content": body})
+            if not r.get("ok"): print("ОШИБКА:", r.get("error")); return
+            print(f"✔ сохранён в облако: {r['name']} "
+                  f"({'перезаписан' if r['replaced'] else 'создан'}, {r['bytes']} знаков)")
+        except Exception as e:
+            print(f"ОБЛАКО НЕДОСТУПНО ({e.__class__.__name__}). Сохраните файл вручную.")
+        return
+
     if a.cmd == "new":
         dst = a.out or "Протокол.md"
         open(dst, "w", encoding="utf-8").write(new_protocol(a.title, a.place, a.grif, today))
@@ -494,9 +563,11 @@ def main():
         nodes.insert(idx, node)
         write(a.file, head, nodes, today)
         if node["kind"] == "sect":
-            print(f"✔ {head['title'].split('.')[0]} → создан раздел {num} «{node['text']}»")
+            msg = f"+ {num} создан раздел «{node['text']}»"
         else:
-            print(f"✔ {head['title'].split('.')[0]} → {num} · {node['text']} · {node['otv']} · {node['srok']}")
+            msg = f"+ {num} {node['text']} · {node['otv']} · {node['srok']}"
+        journal(a.file, msg)
+        print("✔ " + msg)
         return
     if a.cmd == "set":
         tgt = [n for n in nodes if n["num"] == a.num]
@@ -507,7 +578,9 @@ def main():
         if a.otv:  n["otv"] = a.otv.strip();  ch.append(f"ответственный: {n['otv']}")
         if a.srok: old = n["srok"]; n["srok"] = a.srok.strip(); ch.append(f"срок {old} → {n['srok']}")
         write(a.file, head, nodes, today)
-        print(f"✔ {head['title'].split('.')[0]} → пункт {a.num}: " + ", ".join(ch))
+        msg = f"~ {a.num} " + ", ".join(ch)
+        journal(a.file, msg)
+        print("✔ " + msg)
         return
     if a.cmd == "del":
         gone = [n for n in nodes if n["num"] == a.num or n["num"].startswith(a.num + ".")]
@@ -520,7 +593,75 @@ def main():
             head["deleted"] = ", ".join(sorted(set(d + [str(top)]), key=int))
         write(a.file, head, nodes, today)
         left = ", ".join(n["num"] for n in nodes)
-        print(f"✔ {head['title'].split('.')[0]} → {a.num} удалён · без изменений: {left}")
+        msg = f"− {a.num} удалён · без изменений: {left}"
+        journal(a.file, msg)
+        print("✔ " + msg)
+        return
+
+    if a.cmd == "head":
+        ch = []
+        if a.title: head["title"] = a.title.strip(); ch.append("название")
+        if a.place: head["place"] = a.place.strip(); ch.append("место")
+        if a.grif:
+            base = re.sub(r"\s*\([^)]*\)\s*$", "", head["title"]).strip()
+            g = a.grif.strip()
+            head["title"] = base if g in ("-", "нет", "") else f"{base} ({g})"
+            ch.append("гриф")
+        write(a.file, head, nodes, today)
+        msg = "шапка: " + ", ".join(ch) + f" → {head['title']}, {head['place']}"
+        journal(a.file, msg); print("✔ " + msg)
+        return
+    if a.cmd == "undo":
+        if not os.path.exists(BAK):
+            print("НЕЧЕГО ОТМЕНЯТЬ"); return
+        cur = open(a.file, encoding="utf-8").read()
+        open(a.file, "w", encoding="utf-8").write(open(BAK, encoding="utf-8").read())
+        open(BAK, "w", encoding="utf-8").write(cur)      # повторный undo вернёт обратно
+        lines = []
+        if os.path.exists(JRN):
+            lines = open(JRN, encoding="utf-8").read().splitlines()
+        last = lines.pop() if lines else ""
+        open(JRN, "w", encoding="utf-8").write("\n".join(lines) + ("\n" if lines else ""))
+        print("✔ отменено: " + (last or "последнее изменение"))
+        return
+    if a.cmd == "changes":
+        if not os.path.exists(JRN) or not open(JRN, encoding="utf-8").read().strip():
+            print("Изменений за это совещание нет"); return
+        print(open(JRN, encoding="utf-8").read().rstrip())
+        return
+
+    if a.cmd == "show" and a.num:
+        sel = [(n, m) for n, m in zip(nodes, marks)
+               if n["num"] == a.num or n["num"].startswith(a.num + ".")]
+        if not sel:
+            print(f"НЕТ ПУНКТА {a.num}"); return
+        print(show(head, [n for n, _ in sel], [m for _, m in sel], True))
+        return
+    if a.cmd == "fix":
+        if a.promote:
+            tgt = [n for n in nodes if n["num"] == a.promote]
+            if not tgt: print(f"НЕТ ПУНКТА {a.promote}"); return
+            n = tgt[0]; old = n["num"]; n["num"] = str(next_top(head, nodes))
+            nodes.remove(n); nodes.append(n)
+            write(a.file, head, nodes, today)
+            msg = f"структура: {old} → {n['num']} (вынесен в самостоятельный пункт)"
+        elif a.to_section:
+            tgt = [n for n in nodes if n["num"] == a.to_section]
+            if not tgt: print(f"НЕТ ПУНКТА {a.to_section}"); return
+            n = tgt[0]; n["kind"] = "sect"; n["otv"] = None; n["srok"] = None
+            write(a.file, head, nodes, today)
+            msg = f"структура: {n['num']} → раздел-заголовок (поля убраны)"
+        elif a.to_item:
+            tgt = [n for n in nodes if n["num"] == a.to_item]
+            if not tgt: print(f"НЕТ ПУНКТА {a.to_item}"); return
+            n = tgt[0]; n["kind"] = "item"
+            n["otv"] = a.otv.strip() or "—"; n["srok"] = a.srok.strip() or "—"
+            write(a.file, head, nodes, today)
+            msg = f"структура: {n['num']} → пункт · {n['otv']} · {n['srok']}"
+        else:
+            print("УКАЖИТЕ --promote N.M | --to-section N | --to-item N"); return
+        journal(a.file, msg); print("✔ " + msg)
+        print("Проверьте нумерацию: при необходимости выполните renum.")
         return
 
     if a.cmd == "show":   print(show(head, nodes, marks, True))
