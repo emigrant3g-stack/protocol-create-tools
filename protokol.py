@@ -3,13 +3,19 @@
 """
 protokol.py — разбор и сборка протоколов совещаний ПО «ФОРЭНЕРГО».
 
-Использование:
-    python protokol.py show    Протокол_4_ИНСТА.md [--date 28.08.2026]
-    python protokol.py short   Протокол_4_ИНСТА.md
-    python protokol.py people  Протокол_4_ИНСТА.md
-    python protokol.py md      Протокол_4_ИНСТА.md  --out Протокол_4_ИНСТА.md
-    python protokol.py print   Протокол_4_ИНСТА.md  --tpl Шаблон_протокола_на_печать.docx
-    python protokol.py renum   Протокол_4_ИНСТА.md  --out Протокол_4_ИНСТА.md
+Использование (<протокол.md> — файл любого протокола, имя произвольное):
+    python protokol.py show    <протокол.md> [--date ДД.ММ.ГГГГ]
+    python protokol.py short   <протокол.md>
+    python protokol.py people  <протокол.md>
+    python protokol.py md      <протокол.md>  --out <протокол.md>
+    python protokol.py print   <протокол.md>  [--tpl шаблон.docx]
+    python protokol.py renum   <протокол.md>  --out <протокол.md>
+
+Если на совещании переносили сроки — перечислить эти номера:
+    python protokol.py print <протокол.md> --moved 7,9.1
+
+Имя файла ничем не ограничено: скрипт читает структуру из содержимого,
+а не из названия. Протоколов может быть сколько угодно.
 
 Шаблон печати скрипт при отсутствии рядом сам тянет с GitHub:
     https://github.com/emigrant3g-stack/protocol-create-tools  (ветка main)
@@ -153,15 +159,19 @@ def parse(path):
     return head, nodes
 
 
-def escalate(nodes, today):
-    """Метка = N0 + 1, если базовый срок просрочен. Возвращает список итоговых меток."""
+def escalate(nodes, today, moved=()):
+    """Метка = N0 + 1, если пункт просрочен.
+    Просрочен = срок в файле раньше сегодняшней даты ИЛИ номер указан в moved
+    (срок перенесли на этом совещании — значит признали просрочку).
+    Никакого «состояния на начало совещания» искать не нужно."""
     year = today.year
+    moved = set(str(x).strip() for x in moved if str(x).strip())
     out = []
     for n in nodes:
         if n["kind"] != "item":
             out.append(0); continue
         d = deadline(n["srok"], year)
-        over = d is not None and today > d
+        over = (d is not None and today > d) or (n["num"] in moved)
         out.append(n["mark"] + (1 if over else 0))
     return out
 
@@ -333,15 +343,17 @@ def to_docx(head, nodes, marks, tpl, out_path, today):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("cmd", choices=["show", "short", "people", "md", "print", "renum"])
-    ap.add_argument("file")
+    ap.add_argument("file", help="файл протокола .md (любое имя)")
     ap.add_argument("--tpl", default=TPL_NAME)
     ap.add_argument("--out")
     ap.add_argument("--date")
+    ap.add_argument("--moved", default="", help="номера пунктов, у которых срок перенесён на этом совещании: --moved 7,9.1")
     a = ap.parse_args()
     today = (datetime.datetime.strptime(a.date, "%d.%m.%Y").date() if a.date
              else datetime.date.today())
     head, nodes = parse(a.file)
-    marks = escalate(nodes, today)
+    moved = [x for x in a.moved.split(",") if x.strip()]
+    marks = escalate(nodes, today, moved)
     if a.cmd == "show":   print(show(head, nodes, marks, True))
     elif a.cmd == "short":print(show(head, nodes, marks, False))
     elif a.cmd == "people":print("\n".join(people(nodes)))
@@ -352,7 +364,7 @@ def main():
     elif a.cmd == "renum":
         new_nodes, mapping = renumber(nodes)
         head["deleted"] = ""   # после перенумерации дыр нет
-        marks2 = escalate(new_nodes, today)
+        marks2 = escalate(new_nodes, today, moved)
         changed = [(o, n) for o, n in mapping if o != n]
         print("ПЕРЕНУМЕРАЦИЯ: изменено номеров — %d из %d" % (len(changed), len(mapping)))
         for o, n in changed:
