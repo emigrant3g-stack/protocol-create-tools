@@ -339,11 +339,77 @@ def to_docx(head, nodes, marks, tpl, out_path, today):
     return out_path
 
 
+def check(head, nodes):
+    """Структурные аномалии. Список строк; пусто — всё в порядке."""
+    out = []
+    tops = {}
+    for n in nodes:
+        top = n["num"].split(".")[0]
+        tops.setdefault(top, {"head": None, "subs": []})
+        (tops[top]["subs"] if "." in n["num"] else tops[top]).__setitem__(
+            len(tops[top]["subs"]), n) if False else None
+    for n in nodes:
+        top = n["num"].split(".")[0]
+        if "." in n["num"]:
+            tops[top]["subs"].append(n)
+        else:
+            tops[top]["head"] = n
+    for top, g in tops.items():
+        h, subs = g["head"], g["subs"]
+        if h and h["kind"] == "item" and subs:
+            out.append(f"{top}: поручение с ответственным и сроком, но имеет подпункты — заголовок это или пункт?")
+        if h is None and subs:
+            out.append(f"{top}: номер занят только подпунктами, самой записи «{top}.» нет")
+        if h and h["kind"] == "sect" and not subs:
+            out.append(f"{top}: раздел-заголовок без подпунктов")
+    for n in nodes:
+        if n["kind"] == "item":
+            if not n["otv"]:
+                out.append(f"{n['num']}: не указан ответственный")
+            if not n["srok"]:
+                out.append(f"{n['num']}: не указан срок")
+    nums = [int(n["num"].split(".")[0]) for n in nodes]
+    if nums:
+        missing = sorted(set(range(1, max(nums) + 1)) - set(nums))
+        if missing and not head.get("deleted"):
+            out.append("дыры в нумерации: " + ", ".join(map(str, missing)) +
+                       " — строки «Удалённые номера» нет, происхождение неизвестно")
+    return out
+
+
+def new_protocol(title, place, grif, today):
+    t = title.strip()
+    if grif and grif.strip() and grif.strip() != "-":
+        t = f"{t} ({grif.strip()})"
+    return "\n".join([f"# {t}", "", f"Дата последней редакции: {today:%d.%m.%Y}",
+                       place.strip(), "", "```", "```", ""])
+
+
+def merge(files, today):
+    out = ["# МАСТЕР-ФАЙЛ ПРОТОКОЛОВ СОВЕЩАНИЙ", "",
+           "**ПО «ФОРЭНЕРГО»** · производственное объединение",
+           f"**Актуально на: {today:%d.%m.%Y}**", "", "## ОГЛАВЛЕНИЕ", "",
+           "| № | Протокол | Дата |", "|---|---|---|"]
+    bodies = []
+    for i, p in enumerate(files, start=1):
+        h, ns = parse(p)
+        out.append(f"| {i} | {h['title']} | {h['date']} |")
+        bodies.append(open(p, encoding="utf-8").read().strip())
+    out.append("")
+    for b in bodies:
+        out += ["---", "", b, ""]
+    return "\n".join(out)
+
+
 # ---------- CLI ----------
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=["show", "short", "people", "md", "print", "renum"])
-    ap.add_argument("file", help="файл протокола .md (любое имя)")
+    ap.add_argument("cmd", choices=["show", "short", "people", "md", "print",
+                                    "renum", "check", "finish", "new", "merge"])
+    ap.add_argument("file", nargs="?", help="файл протокола .md (любое имя)")
+    ap.add_argument("--files", nargs="*", default=[], help="для merge: список файлов протоколов")
+    ap.add_argument("--title", default=""); ap.add_argument("--place", default="")
+    ap.add_argument("--grif", default="")
     ap.add_argument("--tpl", default=TPL_NAME)
     ap.add_argument("--out")
     ap.add_argument("--date")
@@ -351,6 +417,15 @@ def main():
     a = ap.parse_args()
     today = (datetime.datetime.strptime(a.date, "%d.%m.%Y").date() if a.date
              else datetime.date.today())
+    if a.cmd == "new":
+        dst = a.out or "Протокол.md"
+        open(dst, "w", encoding="utf-8").write(new_protocol(a.title, a.place, a.grif, today))
+        print("saved:", dst); return
+    if a.cmd == "merge":
+        dst = a.out or "Мастерфайл_Протоколы_ФОРЭНЕРГО.md"
+        open(dst, "w", encoding="utf-8").write(merge(a.files or [a.file], today))
+        print("saved:", dst); return
+
     head, nodes = parse(a.file)
     moved = [x for x in a.moved.split(",") if x.strip()]
     marks = escalate(nodes, today, moved)
@@ -377,6 +452,21 @@ def main():
             print("saved:", a.out)
         if changed:
             print("Нумерация изменена — распечатайте протокол заново.")
+    elif a.cmd == "check":
+        issues = check(head, nodes)
+        print("\n".join("• " + x for x in issues) if issues else "Структура в порядке")
+    elif a.cmd == "finish":
+        md_path = a.file
+        open(md_path, "w", encoding="utf-8").write(to_md(head, nodes, marks, today) + "\n")
+        print("saved md:", md_path)
+        tpl = ensure_tpl(a.tpl)
+        if not tpl:
+            print(f"НЕТ ШАБЛОНА. Приложите {TPL_NAME}."); return
+        head2, nodes2 = parse(md_path)
+        marks2 = escalate(nodes2, today, moved)
+        out = a.out or f"Протокол_{head2['title'].split('.')[0]}_{today:%d.%m.%Y}.docx"
+        print("saved docx:", to_docx(head2, nodes2, marks2, tpl, out, today))
+        print("ОТДАТЬ РУКОВОДИТЕЛЮ ОБА ФАЙЛА:", md_path, "и", out)
     elif a.cmd == "print":
         tpl = ensure_tpl(a.tpl)
         if not tpl:
