@@ -830,7 +830,7 @@ def main():
         marks2 = escalate(nodes2, today, moved)
         out = a.out or f"Протокол_{head2['title'].split('.')[0]}_{today:%d.%m.%Y}.docx"
         print("saved docx:", to_docx(head2, nodes2, marks2, tpl, out, today))
-        print("ОТДАТЬ РУКОВОДИТЕЛЮ ОБА ФАЙЛА:", md_path, "и", out)
+        print(f"# служебное, в чат не выводить: приложи к ответу оба файла — {md_path} и {out}")
     elif a.cmd == "print":
         tpl = ensure_tpl(a.tpl)
         if not tpl:
