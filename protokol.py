@@ -591,6 +591,27 @@ def pos_after(nodes, parent):
     return (last + 1) if last is not None else len(nodes)
 
 
+# ---------- имя файла ----------
+FS_FORBIDDEN = re.compile(r'[\\/:*?"<>|\r\n\t]+')
+
+
+def safe_filename(title, maxlen=120):
+    """Название протокола → безопасное имя файла для docx/md.
+
+    Убирает символы, недопустимые в именах файлов Windows/macOS
+    (\\ / : * ? " < > |), из-за которых раньше падала сборка —
+    например «/» в «ООО «ИНСТА» / АО «Энергия+21»». Заменяет их на «-»,
+    схлопывает лишние пробелы и повторные «-», обрезает длину."""
+    s = FS_FORBIDDEN.sub("-", title or "")
+    s = re.sub(r"\s+", " ", s).strip()
+    s = re.sub(r"-{2,}", "-", s).strip(" -.")
+    if not s:
+        s = "Протокол"
+    if len(s) > maxlen:
+        s = s[:maxlen].rstrip(" -.")
+    return s
+
+
 # ---------- CLI ----------
 def main():
     ap = argparse.ArgumentParser()
@@ -828,7 +849,7 @@ def main():
             print(f"НЕТ ШАБЛОНА. Приложите {TPL_NAME}."); return
         head2, nodes2 = parse(md_path)
         marks2 = escalate(nodes2, today, moved)
-        out = a.out or f"Протокол_{head2['title'].split('.')[0]}_{today:%d.%m.%Y}.docx"
+        out = a.out or f"Протокол_{safe_filename(head2['title'].split('.')[0])}_{today:%d.%m.%Y}.docx"
         print("saved docx:", to_docx(head2, nodes2, marks2, tpl, out, today))
         print(f"# служебное, в чат не выводить: приложи к ответу оба файла — {md_path} и {out}")
     elif a.cmd == "print":
@@ -836,7 +857,7 @@ def main():
         if not tpl:
             print(f"НЕТ ШАБЛОНА. Приложите {TPL_NAME} к чату.")
             return
-        out = a.out or f"Протокол_{head['title'].split('.')[0]}_{today:%d.%m.%Y}.docx"
+        out = a.out or f"Протокол_{safe_filename(head['title'].split('.')[0])}_{today:%d.%m.%Y}.docx"
         print("saved:", to_docx(head, nodes, marks, tpl, out, today))
 
 
