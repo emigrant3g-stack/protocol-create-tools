@@ -11,11 +11,40 @@ protokol.py — разбор и сборка протоколов совещан
     python protokol.py print   Протокол_4_ИНСТА.md  --tpl Шаблон_протокола_на_печать.docx
     python protokol.py renum   Протокол_4_ИНСТА.md  --out Протокол_4_ИНСТА.md
 
+Шаблон печати скрипт при отсутствии рядом сам тянет с GitHub:
+    https://github.com/emigrant3g-stack/protocol-create-tools  (ветка main)
+Нет сети — скрипт скажет приложить файл.
+
 Скрипт читает файл протокола в структуру (двумерный массив узлов),
 считает просрочку и метки эскалации и выдаёт нужное представление.
 Никаких «на глаз»: даты сравниваются арифметикой.
 """
-import re, sys, argparse, datetime, copy
+import re, sys, argparse, datetime, copy, os, urllib.request, urllib.parse
+
+# ---------- источники ----------
+GH_RAW = "https://raw.githubusercontent.com/emigrant3g-stack/protocol-create-tools/main/"
+TPL_NAME = "Шаблон_протокола_на_печать.docx"
+TPL_URL = GH_RAW + urllib.parse.quote(TPL_NAME)
+
+
+def ensure_tpl(path):
+    """Вернуть путь к шаблону. Нет локально — попробовать скачать с GitHub.
+    Нет сети — вернуть None, вызывающая сторона попросит приложить файл."""
+    if path and os.path.exists(path):
+        return path
+    dst = path or TPL_NAME
+    try:
+        req = urllib.request.Request(TPL_URL, headers={"User-Agent": "protokol.py"})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            data = r.read()
+        if not data.startswith(b"PK"):
+            return None
+        open(dst, "wb").write(data)
+        sys.stderr.write(f"шаблон загружен с GitHub: {len(data)} байт\n")
+        return dst
+    except Exception as e:
+        sys.stderr.write(f"шаблон недоступен ({e.__class__.__name__}); приложите {TPL_NAME}\n")
+        return None
 
 # ---------- модель ----------
 # узел: dict(num, kind, mark, text, otv, srok)
@@ -305,7 +334,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("cmd", choices=["show", "short", "people", "md", "print", "renum"])
     ap.add_argument("file")
-    ap.add_argument("--tpl", default="Шаблон_протокола_на_печать.docx")
+    ap.add_argument("--tpl", default=TPL_NAME)
     ap.add_argument("--out")
     ap.add_argument("--date")
     a = ap.parse_args()
@@ -337,8 +366,12 @@ def main():
         if changed:
             print("Нумерация изменена — распечатайте протокол заново.")
     elif a.cmd == "print":
+        tpl = ensure_tpl(a.tpl)
+        if not tpl:
+            print(f"НЕТ ШАБЛОНА. Приложите {TPL_NAME} к чату.")
+            return
         out = a.out or f"Протокол_{head['title'].split('.')[0]}_{today:%d.%m.%Y}.docx"
-        print("saved:", to_docx(head, nodes, marks, a.tpl, out, today))
+        print("saved:", to_docx(head, nodes, marks, tpl, out, today))
 
 
 if __name__ == "__main__":
