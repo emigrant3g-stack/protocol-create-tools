@@ -84,13 +84,103 @@ MARK_RE = re.compile(r"^(Повторно!|В (?:третий|четвёртый
 MARK_N = {v: k for k, v in MARKS.items() if v}
 
 MONTHS = {"январ": 1, "феврал": 2, "март": 3, "апрел": 4, "ма": 5, "июн": 6,
-          "июл": 7, "август": 8, "сентябр": 9, "октябр": 10, "November": 11,
+          "июл": 7, "август": 8, "сентябр": 9, "октябр": 10,
           "ноябр": 11, "декабр": 12}
 NO_DEADLINE = ("постоянно", "до результата", "до востребования", "пауза", "—", "-", "")
 
 
 def last_day(y, m):
     return (datetime.date(y + (m == 12), (m % 12) + 1, 1) - datetime.timedelta(days=1)).day
+
+
+def add_months(d, k):
+    y, m = d.year + (d.month - 1 + k) // 12, (d.month - 1 + k) % 12 + 1
+    return datetime.date(y, m, min(d.day, last_day(y, m)))
+
+
+def add_workdays(d, k):
+    while k > 0:
+        d += datetime.timedelta(days=1)
+        if d.weekday() < 5:
+            k -= 1
+    return d
+
+
+WD = {"понедельн": 0, "вторн": 1, "сред": 2, "четверг": 3, "четвертг": 3,
+      "пятниц": 4, "суббот": 5, "воскресен": 6}
+NUMWORD = {"один": 1, "одну": 1, "два": 2, "две": 2, "три": 3, "четыре": 4,
+           "пять": 5, "шесть": 6, "семь": 7, "восемь": 8, "девять": 9,
+           "десять": 10, "пару": 2, "полтора": 1, "полторы": 1}
+
+
+def norm_srok(srok, base):
+    """«через неделю», «в следующую среду» → «01.09.2026». База — дата совещания.
+    Абсолютные и бессрочные формулировки возвращаются как есть."""
+    raw = (srok or "").strip()
+    s = raw.lower().replace("ё", "е")
+    if s in [x.replace("ё", "е") for x in NO_DEADLINE]:
+        return raw
+    within = bool(re.match(r"^(?:в течение|в течении)\s+", s))
+    s = re.sub(r"^(?:к|до|на|в течение|в течении)\s+", "", s).strip()
+    s = re.sub(r"[.!]+$", "", s).strip()
+
+    def out(d):
+        return d.strftime("%d.%m.%Y")
+
+    if s in ("сегодня", "сейчас"):            return out(base)
+    if s == "завтра":                          return out(base + datetime.timedelta(days=1))
+    if s == "послезавтра":                     return out(base + datetime.timedelta(days=2))
+
+    def qty(txt, default=1):
+        m = re.search(r"(\d+)", txt)
+        if m:
+            return int(m.group(1))
+        for w, v in NUMWORD.items():
+            if w in txt:
+                return v
+        return default
+
+    # «через …» и «в течение …»
+    rel = re.sub(r"^через\s+", "", s)
+    if rel != s or within or re.match(
+            r"^\d+\s*(календарн\w*\s*|рабоч\w*\s*)?(дн|недел|месяц|год|лет)", s):
+        t = rel
+        if re.search(r"рабоч\w*\s*дн", t):     return out(add_workdays(base, qty(t)))
+        if re.search(r"\bдн(ей|я|ь)\b|\bсутки\b|\bсуток\b", t):
+            return out(base + datetime.timedelta(days=qty(t)))
+        if "полторы недел" in t:               return out(base + datetime.timedelta(days=10))
+        if re.search(r"недел", t):             return out(base + datetime.timedelta(days=7 * qty(t)))
+        if "полгода" in t or "пол года" in t:  return out(add_months(base, 6))
+        if re.search(r"квартал", t):           return out(add_months(base, 3))
+        if re.search(r"полтора\s*месяц", t):   return out(base + datetime.timedelta(days=45))
+        if re.search(r"месяц", t):             return out(add_months(base, qty(t)))
+        if re.search(r"\bгод|\bлет\b", t):     return out(add_months(base, 12 * qty(t)))
+
+    # «к концу недели / месяца / квартала / года», «до конца …»
+    if re.search(r"конц\w*\s+недел", s):
+        return out(base + datetime.timedelta(days=(4 - base.weekday()) % 7))
+    if re.search(r"конц\w*\s+месяц", s):
+        return out(datetime.date(base.year, base.month, last_day(base.year, base.month)))
+    if re.search(r"конц\w*\s+квартал", s):
+        mo = ((base.month - 1) // 3 + 1) * 3
+        return out(datetime.date(base.year, mo, last_day(base.year, mo)))
+    if re.search(r"конц\w*\s+год", s):
+        return out(datetime.date(base.year, 12, 31))
+
+    # дни недели: «в следующую среду», «в среду», «к пятнице», «в ближайший вторник»
+    for stem, wd in WD.items():
+        if stem in s:
+            step = (wd - base.weekday()) % 7
+            if step == 0:
+                step = 7
+            d = base + datetime.timedelta(days=step)
+            if re.search(r"следующ|через\s+недел", s):
+                # понедельник следующей календарной недели + смещение
+                nxt = base + datetime.timedelta(days=7 - base.weekday())
+                d = nxt + datetime.timedelta(days=wd)
+            return out(d)
+
+    return raw
 
 
 def deadline(srok, year):
@@ -534,7 +624,8 @@ def main():
             print(f"✔ сохранён в облако: {r['name']} "
                   f"({'перезаписан' if r['replaced'] else 'создан'}, {r['bytes']} знаков)")
         except Exception as e:
-            print(f"ОБЛАКО НЕДОСТУПНО ({e.__class__.__name__}). Сохраните файл вручную.")
+            print(f"ОБЛАКО НЕДОСТУПНО ({e.__class__.__name__}: {e}). "
+                  f"Сохраните файл вручную.")
         return
 
     if a.cmd == "new":
@@ -559,7 +650,8 @@ def main():
             node = dict(num=num, kind="sect", mark=1, text=a.section.strip(), otv=None, srok=None)
         else:
             node = dict(num=num, kind="item", mark=1, text=a.text.strip(),
-                        otv=(a.otv.strip() or "—"), srok=(a.srok.strip() or "—"))
+                        otv=(a.otv.strip() or "—"),
+                        srok=(norm_srok(a.srok, today) or "—"))
         nodes.insert(idx, node)
         write(a.file, head, nodes, today)
         if node["kind"] == "sect":
@@ -576,7 +668,9 @@ def main():
         n = tgt[0]; ch = []
         if a.text: n["text"] = a.text.strip(); ch.append("текст изменён")
         if a.otv:  n["otv"] = a.otv.strip();  ch.append(f"ответственный: {n['otv']}")
-        if a.srok: old = n["srok"]; n["srok"] = a.srok.strip(); ch.append(f"срок {old} → {n['srok']}")
+        if a.srok:
+            old = n["srok"]; n["srok"] = norm_srok(a.srok, today)
+            ch.append(f"срок {old} → {n['srok']}")
         write(a.file, head, nodes, today)
         msg = f"~ {a.num} " + ", ".join(ch)
         journal(a.file, msg)
