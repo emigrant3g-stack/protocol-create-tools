@@ -401,15 +401,66 @@ def merge(files, today):
     return "\n".join(out)
 
 
+def used_numbers(head, nodes):
+    used = set()
+    for n in nodes:
+        used.add(int(n["num"].split(".")[0]))
+    for x in re.findall(r"\d+", head.get("deleted", "") or ""):
+        used.add(int(x))
+    return used
+
+
+def next_top(head, nodes):
+    u = used_numbers(head, nodes)
+    return (max(u) + 1) if u else 1
+
+
+def next_sub(nodes, parent):
+    subs = [int(n["num"].split(".")[1]) for n in nodes
+            if n["num"].startswith(parent + ".") and n["num"].count(".") == 1]
+    return (max(subs) + 1) if subs else 1
+
+
+def write(path, head, nodes, today, keep_date=True):
+    """Записать файл, не трогая дату последней редакции (её ставит finish/md)."""
+    d = head.get("date") or f"{today:%d.%m.%Y}"
+    out = [f"# {head['title']}", "", f"Дата последней редакции: {d}", head["place"]]
+    if head.get("deleted"): out.append(f"Удалённые номера: {head['deleted']}")
+    out += ["", "```"]
+    if head.get("block"): out += [head["block"], ""]
+    for n in nodes:
+        pre = (label(n["mark"]) + " ") if n["mark"] > 1 else ""
+        out.append(f"{n['num']}. {pre}{n['text']}")
+        if n["kind"] == "item":
+            out.append(f"Ответственный: {n['otv']}    Срок: {n['srok']}")
+        out.append("")
+    out.append("```")
+    open(path, "w", encoding="utf-8").write("\n".join(out) + "\n")
+
+
+def pos_after(nodes, parent):
+    """Индекс, куда вставить новый подпункт: после последнего подпункта parent."""
+    last = None
+    for i, n in enumerate(nodes):
+        if n["num"] == parent or n["num"].startswith(parent + "."):
+            last = i
+    return (last + 1) if last is not None else len(nodes)
+
+
 # ---------- CLI ----------
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("cmd", choices=["show", "short", "people", "md", "print",
-                                    "renum", "check", "finish", "new", "merge"])
+                                    "renum", "check", "finish", "new", "merge",
+                                    "add", "set", "del"])
     ap.add_argument("file", nargs="?", help="файл протокола .md (любое имя)")
     ap.add_argument("--files", nargs="*", default=[], help="для merge: список файлов протоколов")
     ap.add_argument("--title", default=""); ap.add_argument("--place", default="")
     ap.add_argument("--grif", default="")
+    ap.add_argument("--num", default="", help="номер узла для set/del")
+    ap.add_argument("--parent", default="", help="номер родителя для add: подпункт")
+    ap.add_argument("--text", default=""); ap.add_argument("--otv", default="")
+    ap.add_argument("--srok", default=""); ap.add_argument("--section", default="")
     ap.add_argument("--tpl", default=TPL_NAME)
     ap.add_argument("--out")
     ap.add_argument("--date")
@@ -429,6 +480,49 @@ def main():
     head, nodes = parse(a.file)
     moved = [x for x in a.moved.split(",") if x.strip()]
     marks = escalate(nodes, today, moved)
+    if a.cmd == "add":
+        if a.parent:
+            num = f"{a.parent}.{next_sub(nodes, a.parent)}"
+            idx = pos_after(nodes, a.parent)
+        else:
+            num = str(next_top(head, nodes)); idx = len(nodes)
+        if a.section:
+            node = dict(num=num, kind="sect", mark=1, text=a.section.strip(), otv=None, srok=None)
+        else:
+            node = dict(num=num, kind="item", mark=1, text=a.text.strip(),
+                        otv=(a.otv.strip() or "—"), srok=(a.srok.strip() or "—"))
+        nodes.insert(idx, node)
+        write(a.file, head, nodes, today)
+        if node["kind"] == "sect":
+            print(f"✔ {head['title'].split('.')[0]} → создан раздел {num} «{node['text']}»")
+        else:
+            print(f"✔ {head['title'].split('.')[0]} → {num} · {node['text']} · {node['otv']} · {node['srok']}")
+        return
+    if a.cmd == "set":
+        tgt = [n for n in nodes if n["num"] == a.num]
+        if not tgt:
+            print(f"НЕТ ПУНКТА {a.num}"); return
+        n = tgt[0]; ch = []
+        if a.text: n["text"] = a.text.strip(); ch.append("текст изменён")
+        if a.otv:  n["otv"] = a.otv.strip();  ch.append(f"ответственный: {n['otv']}")
+        if a.srok: old = n["srok"]; n["srok"] = a.srok.strip(); ch.append(f"срок {old} → {n['srok']}")
+        write(a.file, head, nodes, today)
+        print(f"✔ {head['title'].split('.')[0]} → пункт {a.num}: " + ", ".join(ch))
+        return
+    if a.cmd == "del":
+        gone = [n for n in nodes if n["num"] == a.num or n["num"].startswith(a.num + ".")]
+        if not gone:
+            print(f"НЕТ ПУНКТА {a.num}"); return
+        nodes = [n for n in nodes if n not in gone]
+        top = int(a.num.split(".")[0])
+        if "." not in a.num and top == max(used_numbers(head, nodes + gone)):
+            d = [x for x in re.findall(r"\d+", head.get("deleted", "") or "")]
+            head["deleted"] = ", ".join(sorted(set(d + [str(top)]), key=int))
+        write(a.file, head, nodes, today)
+        left = ", ".join(n["num"] for n in nodes)
+        print(f"✔ {head['title'].split('.')[0]} → {a.num} удалён · без изменений: {left}")
+        return
+
     if a.cmd == "show":   print(show(head, nodes, marks, True))
     elif a.cmd == "short":print(show(head, nodes, marks, False))
     elif a.cmd == "people":print("\n".join(people(nodes)))
