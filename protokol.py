@@ -220,18 +220,75 @@ def deadline(srok, year):
     return None
 
 
+def read_text(path):
+    """Прочитать файл протокола, приведя к единому виду независимо от того,
+    на чём его сохранили. Windows и iPhone/iPad кладут иное:
+      • UTF-8 BOM (\\ufeff) в начале — из-за него «# Название» переставало
+        читаться, потому что «#» уже не первый символ строки;
+      • переводы строк CRLF (\\r\\n) или CR (\\r) вместо LF — из-за них
+        регулярка блока кода ```\\n…``` не срабатывала и протокол читался
+        пустым.
+    Здесь и только здесь решаем эти различия: снимаем BOM, любые переводы
+    строк приводим к \\n. Дальше по коду текст всегда «чистый»."""
+    with open(path, "rb") as fh:
+        raw = fh.read()
+    txt = raw.decode("utf-8-sig")             # utf-8-sig снимает BOM, если он есть
+    return txt.replace("\r\n", "\n").replace("\r", "\n")
+
+
+# «значение на той же строке»: [^\S\n]* — пробелы/табы, КРОМЕ перевода строки.
+# Обычный \s* перепрыгивал через \n и, когда значение поля пустое, захватывал
+# следующую непустую строку (например, ограду блока кода ```), из-за чего
+# «Удалённые номера:» с пустым значением ломали разбор всего протокола.
+_DATE_RE    = re.compile(r"^Дата последней редакции:[^\S\n]*(.*)$", re.M)
+_DELETED_RE = re.compile(r"^Удал[её]нные номера:[^\S\n]*(.*)$", re.M)
+# Разделитель между «Ответственный: …» и «Срок: …» скрипт пишет четырьмя
+# пробелами, но в файле, побывавшем в ручной правке на телефоне/в Google Docs,
+# это может стать одним пробелом, табом или неразрывным пробелом. Поэтому поля
+# не разбираем по числу пробелов, а режем строку по литералу «Срок:» — что до
+# него принадлежит ответственному, что после — сроку. Так ответственный не
+# теряется молча ни при каком разделителе.
+_SROK_SPLIT = re.compile(r"\bСрок:")
+def _parse_field(line):
+    line = line.strip()
+    if not line.startswith("Ответственный:"):
+        return None
+    body = line[len("Ответственный:"):]
+    parts = _SROK_SPLIT.split(body, 1)
+    otv = parts[0].strip()
+    srok = parts[1].strip() if len(parts) > 1 else ""
+    return otv, srok
+_ITEM_RE    = re.compile(r"^(\d+(?:\.\d+)?)\.\s+(.*)$")
+_FENCE_RE   = re.compile(r"^```")
+
+
+def _find_body(lines):
+    """Строки между первой и последней оградой ```. Ограда ищется как строка,
+    начинающаяся с ``` (возможно с указанием языка: ```text) — не подстрокой,
+    иначе испорченная строка шапки с ``` внутри принималась за начало блока."""
+    fences = [i for i, l in enumerate(lines) if _FENCE_RE.match(l.strip())]
+    if len(fences) < 2:
+        return []
+    return lines[fences[0] + 1: fences[-1]]
+
+
 def parse(path):
-    txt = open(path, encoding="utf-8").read()
-    head = {}
-    m = re.search(r"^#\s*(.+)$", txt, re.M);            head["title"] = m.group(1).strip() if m else ""
-    m = re.search(r"Дата последней редакции:\s*(.+)", txt); head["date"] = m.group(1).strip() if m else ""
-    m = re.search(r"Удал[её]нные номера:\s*(.+)", txt)
-    head["deleted"] = m.group(1).strip() if m else ""
-    m = re.search(r"Использованные номера:.*?удалены:\s*([^)]*)\)", txt)   # старый формат
-    if m and not head["deleted"]:
-        d = m.group(1).strip()
-        head["deleted"] = "" if d in ("—", "-", "") else d
+    txt = read_text(path)
     lines = txt.split("\n")
+    head = {}
+    m = re.search(r"^#[^\S\n]*(.+)$", txt, re.M);  head["title"] = m.group(1).strip() if m else ""
+    m = _DATE_RE.search(txt);                       head["date"] = m.group(1).strip() if m else ""
+    m = _DELETED_RE.search(txt)
+    raw_deleted = m.group(1).strip() if m else ""
+    m = re.search(r"Использованные номера:.*?удалены:\s*([^)]*)\)", txt)   # старый формат
+    if m and not raw_deleted:
+        raw_deleted = m.group(1).strip()
+    # Строка «Удалённые номера:» могла быть вписана вручную в блокноте и содержать
+    # что угодно (мусор, «—», буквы, лишние знаки). Правило: берём из неё ТОЛЬКО
+    # целые числа; если валидных чисел нет — ведём себя так, будто строки нет
+    # вовсе. Так ошибочная ручная правка служебной строки не толкуется превратно.
+    dels = [int(x) for x in re.findall(r"\d+", raw_deleted)]
+    head["deleted"] = ", ".join(str(x) for x in sorted(set(dels), key=int)) if dels else ""
     place = ""
     for i, l in enumerate(lines):
         if l.startswith("Дата последней редакции:") and i + 1 < len(lines):
@@ -239,44 +296,52 @@ def parse(path):
     head["place"] = place
     head["block"] = ""
 
-    body = re.search(r"```\n(.*?)```", txt, re.S)
+    bl = _find_body(lines)
     nodes = []
-    if body:
-        bl = body.group(1).split("\n")
-        i = 0
-        while i < len(bl):
-            line = bl[i].strip()
-            m = re.match(r"^(\d+(?:\.\d+)?)\.\s+(.*)$", line)
-            if m:
-                num, rest = m.group(1), m.group(2)
-                mark = 1
-                mm = MARK_RE.match(rest)
-                if mm:
-                    mark = MARK_N[mm.group(1)]; rest = rest[mm.end():]
-                otv = srok = None
-                if i + 1 < len(bl) and bl[i + 1].startswith("Ответственный:"):
-                    f = bl[i + 1]
-                    fm = re.match(r"Ответственный:\s*(.*?)\s{2,}Срок:\s*(.*)$", f)
-                    if fm:
-                        otv, srok = fm.group(1).strip(), fm.group(2).strip()
-                    i += 1
-                nodes.append(dict(num=num, kind="item" if otv is not None else "sect",
-                                  mark=mark, text=rest.strip(), otv=otv, srok=srok))
-            elif line and not line.startswith("Ответственный:"):
-                if nodes:
-                    nodes.append(dict(num="", kind="head", mark=1, text=line,
-                                      otv=None, srok=None))
-                else:
-                    head["block"] = line
-            i += 1
+    i = 0
+    while i < len(bl):
+        line = bl[i].strip()
+        m = _ITEM_RE.match(line)
+        if m:
+            num, rest = m.group(1), m.group(2)
+            mark = 1
+            mm = MARK_RE.match(rest)
+            if mm:
+                mark = MARK_N[mm.group(1)]; rest = rest[mm.end():]
+            otv = srok = None
+            if i + 1 < len(bl) and bl[i + 1].strip().startswith("Ответственный:"):
+                fld = _parse_field(bl[i + 1])
+                otv, srok = fld if fld else ("", "")
+                i += 1
+            nodes.append(dict(num=num, kind="item" if otv is not None else "sect",
+                              mark=mark, text=rest.strip(), otv=otv, srok=srok))
+        elif line and not line.startswith("Ответственный:"):
+            if nodes:
+                nodes.append(dict(num="", kind="head", mark=1, text=line,
+                                  otv=None, srok=None))
+            else:
+                head["block"] = line
+        i += 1
+    # Защита от «тихой потери»: в файле явно есть строки-пункты, а структура
+    # прочиталась пустой → файл повреждён (обычно испорченная шапка). Лучше
+    # громко упасть, чем вернуть пустой протокол и дать перезаписать им файл.
+    if not nodes and any(_ITEM_RE.match(l.strip()) for l in lines):
+        raise ValueError(
+            "файл повреждён: строки-пункты есть, но структура не прочиталась "
+            "(проверьте шапку — пустая строка «Удалённые номера:» или сбитый "
+            "блок ```). Файл не изменялся.")
     return head, nodes
 
 
-def escalate(nodes, today, moved=()):
+def escalate(nodes, today, moved=(), bump=True):
     """Метка = N0 + 1, если пункт просрочен.
     Просрочен = срок в файле раньше сегодняшней даты ИЛИ номер указан в moved
     (срок перенесли на этом совещании — значит признали просрочку).
-    Никакого «состояния на начало совещания» искать не нужно."""
+
+    bump=False — сборка в этой сессии уже была, и повышение на +1 уже вшито в
+    сохранённые метки файла: тогда возвращаем метки как есть, второй раз не
+    поднимаем. Это и не даёт счётчику расти от повторных «собери протокол» /
+    «на печать» в одном чате."""
     year = today.year
     moved = set(str(x).strip() for x in moved if str(x).strip())
     out = []
@@ -284,7 +349,7 @@ def escalate(nodes, today, moved=()):
         if n["kind"] != "item":
             out.append(0); continue
         d = deadline(n["srok"], year)
-        over = (d is not None and today > d) or (n["num"] in moved)
+        over = bump and ((d is not None and today > d) or (n["num"] in moved))
         out.append(n["mark"] + (1 if over else 0))
     return out
 
@@ -510,22 +575,6 @@ def new_protocol(title, place, grif, today):
                        place.strip(), "", "```", "```", ""])
 
 
-def merge(files, today):
-    out = ["# МАСТЕР-ФАЙЛ ПРОТОКОЛОВ СОВЕЩАНИЙ", "",
-           "**ПО «ФОРЭНЕРГО»** · производственное объединение",
-           f"**Актуально на: {today:%d.%m.%Y}**", "", "## ОГЛАВЛЕНИЕ", "",
-           "| № | Протокол | Дата |", "|---|---|---|"]
-    bodies = []
-    for i, p in enumerate(files, start=1):
-        h, ns = parse(p)
-        out.append(f"| {i} | {h['title']} | {h['date']} |")
-        bodies.append(open(p, encoding="utf-8").read().strip())
-    out.append("")
-    for b in bodies:
-        out += ["---", "", b, ""]
-    return "\n".join(out)
-
-
 def used_numbers(head, nodes):
     used = set()
     for n in nodes:
@@ -547,23 +596,86 @@ def next_sub(nodes, parent):
     return (max(subs) + 1) if subs else 1
 
 
-BAK = ".protokol_bak"
-JRN = ".protokol_journal"
+# Служебные файлы (для undo и журнала) держим РЯДОМ с конкретным протоколом
+# и с привязкой к его имени. Раньше это были «.protokol_bak»/«.protokol_journal»
+# в текущей папке: на iPhone/iPad и в Google Drive рабочая папка непредсказуема,
+# поэтому undo мог вернуть не тот файл, а журналы разных протоколов смешивались.
+def _sidecar(path, suffix):
+    d = os.path.dirname(os.path.abspath(path))
+    base = os.path.basename(path)
+    return os.path.join(d, f".{base}{suffix}")
+
+
+def bak_path(path):
+    return _sidecar(path, ".bak")
+
+
+def jrn_path(path):
+    return _sidecar(path, ".journal")
+
+
+def asm_path(path):
+    return _sidecar(path, ".assembled")
+
+
+# ---- защита от повторной эскалации в одной сессии ----
+# Метка «Повторно! / В N-й раз!» повышается на +1 у просроченного пункта РОВНО
+# ОДИН РАЗ за сессию работы с протоколом. Признак «в этой сессии сборка уже
+# была» держим в служебном файле рядом с протоколом (.<имя>.assembled) — НЕ
+# внутри .md, чтобы в самом протоколе не заводить скрытых строк-состояний.
+# Файл живёт в рабочей папке сессии; при загрузке протокола из облака (pull —
+# начало нового совещания) он стирается, поэтому на новом совещании просрочка
+# снова поднимет счётчик на один шаг. Так «В третий раз» переходит в «В
+# четвёртый раз» между совещаниями, но не растёт от повторных «собери
+# протокол»/«на печать» внутри одного чата.
+def assembled_today(path, today):
+    p = asm_path(path)
+    if not os.path.exists(p):
+        return False
+    try:
+        return open(p, encoding="utf-8").read().strip() == today.strftime("%d.%m.%Y")
+    except Exception:
+        return False
+
+
+def mark_assembled(path, today):
+    open(asm_path(path), "w", encoding="utf-8").write(today.strftime("%d.%m.%Y"))
+
+
+def clear_assembled(path):
+    p = asm_path(path)
+    if os.path.exists(p):
+        os.remove(p)
 
 
 def journal(path, line):
-    with open(JRN, "a", encoding="utf-8") as j:
+    with open(jrn_path(path), "a", encoding="utf-8") as j:
         j.write(line.rstrip() + "\n")
 
 
 def backup(path):
     """Сохранить текущую версию файла перед изменением (для undo)."""
     if os.path.exists(path):
-        open(BAK, "w", encoding="utf-8").write(open(path, encoding="utf-8").read())
+        open(bak_path(path), "w", encoding="utf-8").write(
+            open(path, encoding="utf-8").read())
 
 
-def write(path, head, nodes, today, keep_date=True):
-    """Записать файл, не трогая дату последней редакции (её ставит finish/md)."""
+def _real_count(nodes):
+    return sum(1 for n in nodes if n["kind"] != "head")
+
+
+def write(path, head, nodes, today, keep_date=True, min_real=None):
+    """Записать файл, не трогая дату последней редакции (её ставит finish/md).
+
+    min_real — страховка: если задано, отказываемся записывать файл, в котором
+    действующих узлов (пунктов/разделов) стало МЕНЬШЕ этого числа. Команды
+    add/set/head/fix узлы не убирают, поэтому туда передаётся число узлов «до»
+    операции: любое неожиданное уменьшение (симптом прошлого сбоя, когда из
+    протокола пропадали пункты 1–9) останавливает запись, а не портит файл."""
+    if min_real is not None and _real_count(nodes) < min_real:
+        raise ValueError(
+            f"ОТКАЗ ЗАПИСИ: действующих узлов стало {_real_count(nodes)} вместо "
+            f"{min_real}+ — операция не должна уменьшать протокол. Файл не изменён.")
     backup(path)
     d = head.get("date") or f"{today:%d.%m.%Y}"
     out = [f"# {head['title']}", "", f"Дата последней редакции: {d}", head["place"]]
@@ -647,11 +759,10 @@ def safe_filename(title, maxlen=30):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("cmd", choices=["show", "short", "people", "md", "print",
-                                    "renum", "check", "finish", "new", "merge",
+                                    "renum", "check", "finish", "new",
                                     "add", "set", "del", "head", "undo", "changes", "fix",
                                     "push", "pull", "list"])
     ap.add_argument("file", nargs="?", help="файл протокола .md (любое имя)")
-    ap.add_argument("--files", nargs="*", default=[], help="для merge: список файлов протоколов")
     ap.add_argument("--title", default=""); ap.add_argument("--place", default="")
     ap.add_argument("--grif", default="")
     ap.add_argument("--num", default="", help="номер узла для set/del")
@@ -707,10 +818,30 @@ def main():
                 r = cloud(a.url, a.secret, params={"name": name})
                 if not r.get("ok"): print("ОШИБКА:", r.get("error")); return
                 open(name, "w", encoding="utf-8").write(r["content"])
+                # загрузка = начало нового совещания: сбрасываем признак «сборка
+                # была», журнал и резервную копию прошлой сессии, чтобы просрочка
+                # снова могла поднять счётчик на один шаг, а «покажи изменения»
+                # начинало с чистого листа.
+                clear_assembled(name)
+                for p in (jrn_path(name), bak_path(name)):
+                    if os.path.exists(p):
+                        os.remove(p)
                 h, _ = parse(name)
                 print(f"✔ загружен из облака: {name}")
                 print(f"   {h['title']} · редакция {h['date']}")
                 return
+            # Проверка структуры ПЕРЕД отправкой: если файл битый (дыры непонятного
+            # происхождения, раздел без подпунктов, пункт без ответственного/срока и
+            # т.п.) — предупреждаем одной строкой, но сохранение НЕ блокируем: в
+            # облако уходит то, что есть, решение за руководителем.
+            try:
+                issues = check(*parse(a.file))
+            except Exception:
+                issues = []
+            if issues:
+                print("⚠ структура с замечаниями (" + str(len(issues)) +
+                      "): " + "; ".join(issues[:3]) +
+                      ("; …" if len(issues) > 3 else "") + " — сохраняю как есть")
             body = open(a.file, encoding="utf-8").read()
             r = cloud(a.url, a.secret, "POST",
                       {"name": os.path.basename(a.file), "content": body})
@@ -726,14 +857,13 @@ def main():
         dst = a.out or "Протокол.md"
         open(dst, "w", encoding="utf-8").write(new_protocol(a.title, a.place, a.grif, today))
         print("saved:", dst); return
-    if a.cmd == "merge":
-        dst = a.out or "Мастерфайл_Протоколы_ФОРЭНЕРГО.md"
-        open(dst, "w", encoding="utf-8").write(merge(a.files or [a.file], today))
-        print("saved:", dst); return
 
     head, nodes = parse(a.file)
+    base_real = _real_count(nodes)   # сколько действующих узлов было до операции
     moved = [x for x in a.moved.split(",") if x.strip()]
-    marks = escalate(nodes, today, moved)
+    # Поднимать метку на +1 только если в этой сессии сборки ещё не было.
+    do_bump = not assembled_today(a.file, today)
+    marks = escalate(nodes, today, moved, bump=do_bump)
     if a.cmd == "add":
         if a.parent:
             num = f"{a.parent}.{next_sub(nodes, a.parent)}"
@@ -747,7 +877,7 @@ def main():
                         otv=(a.otv.strip() or "—"),
                         srok=(norm_srok(a.srok, today) or "—"))
         nodes.insert(idx, node)
-        write(a.file, head, nodes, today)
+        write(a.file, head, nodes, today, min_real=base_real)
         if node["kind"] == "sect":
             msg = f"+ {num} создан раздел «{node['text']}»"
         else:
@@ -760,12 +890,21 @@ def main():
         if not tgt:
             print(f"НЕТ ПУНКТА {a.num}"); return
         n = tgt[0]; ch = []
-        if a.text: n["text"] = a.text.strip(); ch.append("текст изменён")
-        if a.otv:  n["otv"] = a.otv.strip();  ch.append(f"ответственный: {n['otv']}")
+        # Журнал правок пишем в формате «было → стало» по каждому полю, чтобы
+        # «покажи изменения» показывал, что именно поменялось, а не просто факт.
+        def _short(s, k=40):
+            s = (s or "").strip()
+            return (s[:k] + "…") if len(s) > k else s
+        if a.text:
+            old = n["text"]; n["text"] = a.text.strip()
+            ch.append(f"текст «{_short(old)}» → «{_short(n['text'])}»")
+        if a.otv:
+            old = n["otv"]; n["otv"] = a.otv.strip()
+            ch.append(f"ответственный {old} → {n['otv']}")
         if a.srok:
             old = n["srok"]; n["srok"] = norm_srok(a.srok, today)
             ch.append(f"срок {old} → {n['srok']}")
-        write(a.file, head, nodes, today)
+        write(a.file, head, nodes, today, min_real=base_real)
         msg = f"~ {a.num} " + ", ".join(ch)
         journal(a.file, msg)
         print("✔ " + msg)
@@ -779,9 +918,16 @@ def main():
         if "." not in a.num and top == max(used_numbers(head, nodes + gone)):
             d = [x for x in re.findall(r"\d+", head.get("deleted", "") or "")]
             head["deleted"] = ", ".join(sorted(set(d + [str(top)]), key=int))
-        write(a.file, head, nodes, today)
+        # min_real для удаления: разрешаем убыль ровно на число удаляемых узлов,
+        # но не больше — если удалилось бы лишнее, запись отклоняется.
+        gone_real = sum(1 for n in gone if n["kind"] != "head")
+        write(a.file, head, nodes, today, min_real=base_real - gone_real)
         left = ", ".join(n["num"] for n in nodes if n["kind"] != "head")
-        msg = f"− {a.num} удалён · без изменений: {left}"
+        gone_nums = ", ".join(g["num"] for g in gone if g["kind"] != "head")
+        # При удалении раздела вместе с ним уходят подпункты — перечисляем их
+        # явно, чтобы удаление каскадом было видно, а не только уцелевшие номера.
+        cascade = f" · удалены вместе: {gone_nums}" if len([g for g in gone if g['kind'] != 'head']) > 1 else ""
+        msg = f"− {a.num} удалён{cascade} · без изменений: {left}"
         journal(a.file, msg)
         print("✔ " + msg)
         return
@@ -795,27 +941,29 @@ def main():
             g = a.grif.strip()
             head["title"] = base if g in ("-", "нет", "") else f"{base} ({g})"
             ch.append("гриф")
-        write(a.file, head, nodes, today)
+        write(a.file, head, nodes, today, min_real=base_real)
         msg = "шапка: " + ", ".join(ch) + f" → {head['title']}, {head['place']}"
         journal(a.file, msg); print("✔ " + msg)
         return
     if a.cmd == "undo":
-        if not os.path.exists(BAK):
+        bak = bak_path(a.file); jrn = jrn_path(a.file)
+        if not os.path.exists(bak):
             print("НЕЧЕГО ОТМЕНЯТЬ"); return
         cur = open(a.file, encoding="utf-8").read()
-        open(a.file, "w", encoding="utf-8").write(open(BAK, encoding="utf-8").read())
-        open(BAK, "w", encoding="utf-8").write(cur)      # повторный undo вернёт обратно
+        open(a.file, "w", encoding="utf-8").write(open(bak, encoding="utf-8").read())
+        open(bak, "w", encoding="utf-8").write(cur)      # повторный undo вернёт обратно
         lines = []
-        if os.path.exists(JRN):
-            lines = open(JRN, encoding="utf-8").read().splitlines()
+        if os.path.exists(jrn):
+            lines = open(jrn, encoding="utf-8").read().splitlines()
         last = lines.pop() if lines else ""
-        open(JRN, "w", encoding="utf-8").write("\n".join(lines) + ("\n" if lines else ""))
+        open(jrn, "w", encoding="utf-8").write("\n".join(lines) + ("\n" if lines else ""))
         print("✔ отменено: " + (last or "последнее изменение"))
         return
     if a.cmd == "changes":
-        if not os.path.exists(JRN) or not open(JRN, encoding="utf-8").read().strip():
+        jrn = jrn_path(a.file)
+        if not os.path.exists(jrn) or not open(jrn, encoding="utf-8").read().strip():
             print("Изменений за это совещание нет"); return
-        print(open(JRN, encoding="utf-8").read().rstrip())
+        print(open(jrn, encoding="utf-8").read().rstrip())
         return
 
     if a.cmd == "show" and a.num:
@@ -831,20 +979,20 @@ def main():
             if not tgt: print(f"НЕТ ПУНКТА {a.promote}"); return
             n = tgt[0]; old = n["num"]; n["num"] = str(next_top(head, nodes))
             nodes.remove(n); nodes.append(n)
-            write(a.file, head, nodes, today)
+            write(a.file, head, nodes, today, min_real=base_real)
             msg = f"структура: {old} → {n['num']} (вынесен в самостоятельный пункт)"
         elif a.to_section:
             tgt = [n for n in nodes if n["num"] == a.to_section]
             if not tgt: print(f"НЕТ ПУНКТА {a.to_section}"); return
             n = tgt[0]; n["kind"] = "sect"; n["otv"] = None; n["srok"] = None
-            write(a.file, head, nodes, today)
+            write(a.file, head, nodes, today, min_real=base_real)
             msg = f"структура: {n['num']} → раздел-заголовок (поля убраны)"
         elif a.to_item:
             tgt = [n for n in nodes if n["num"] == a.to_item]
             if not tgt: print(f"НЕТ ПУНКТА {a.to_item}"); return
             n = tgt[0]; n["kind"] = "item"
             n["otv"] = a.otv.strip() or "—"; n["srok"] = a.srok.strip() or "—"
-            write(a.file, head, nodes, today)
+            write(a.file, head, nodes, today, min_real=base_real)
             msg = f"структура: {n['num']} → пункт · {n['otv']} · {n['srok']}"
         else:
             print("УКАЖИТЕ --promote N.M | --to-section N | --to-item N"); return
@@ -857,12 +1005,15 @@ def main():
     elif a.cmd == "people":print("\n".join(people(nodes)))
     elif a.cmd == "md":
         t = to_md(head, nodes, marks, today)
-        if a.out: open(a.out, "w", encoding="utf-8").write(t + "\n"); print("saved:", a.out)
+        if a.out:
+            open(a.out, "w", encoding="utf-8").write(t + "\n"); print("saved:", a.out)
+            mark_assembled(a.out, today)   # сборка была — второй раз не эскалируем
         else: print(t)
     elif a.cmd == "renum":
         new_nodes, mapping = renumber(nodes)
         head["deleted"] = ""   # после перенумерации дыр нет
-        marks2 = escalate(new_nodes, today, moved)
+        # перенумерация метки НЕ трогает — переносим сохранённые как есть
+        marks2 = [n["mark"] for n in new_nodes]
         changed = [(o, n) for o, n in mapping if o != n]
         print("ПЕРЕНУМЕРАЦИЯ: изменено номеров — %d из %d" % (len(changed), len(mapping)))
         for o, n in changed:
@@ -882,11 +1033,14 @@ def main():
         md_path = a.file
         open(md_path, "w", encoding="utf-8").write(to_md(head, nodes, marks, today) + "\n")
         print("saved md:", md_path)
+        mark_assembled(md_path, today)     # сборка была — второй раз не эскалируем
         tpl = ensure_tpl(a.tpl)
         if not tpl:
             print(f"НЕТ ШАБЛОНА. Приложите {TPL_NAME}."); return
         head2, nodes2 = parse(md_path)
-        marks2 = escalate(nodes2, today, moved)
+        # docx делаем из уже собранного .md: метки там окончательные, повторно
+        # не поднимаем (bump=False), иначе docx разошёлся бы с .md на +1.
+        marks2 = escalate(nodes2, today, moved, bump=False)
         out = a.out or f"Протокол_{safe_filename(head2['title'].split('.')[0])}_{today:%d.%m.%Y}.docx"
         print("saved docx:", to_docx(head2, nodes2, marks2, tpl, out, today))
         print(f"# служебное, в чат не выводить: приложи к ответу оба файла — {md_path} и {out}")
@@ -900,4 +1054,11 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except ValueError as e:
+        # Ожидаемые «управляемые» ошибки (повреждённый файл, отказ записи ради
+        # сохранности данных) выводим одной строкой, без трассировки Python:
+        # эта строка идёт руководителю как есть.
+        print(f"ОШИБКА: {e}")
+        sys.exit(1)
