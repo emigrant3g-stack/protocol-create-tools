@@ -457,7 +457,34 @@ def to_md(head, nodes, marks, today):
 def to_docx(head, nodes, marks, tpl, out_path, today):
     from docx import Document
     from docx.text.paragraph import Paragraph
+    from docx.enum.text import WD_TAB_ALIGNMENT
+    from docx.shared import Emu
+    from docx.oxml.ns import qn
     d = Document(tpl); P = d.paragraphs
+
+    # Правый край текстовой области = ширина страницы минус поля. К нему будем
+    # «прибивать» «Срок:» одним правовыравненным табулятором.
+    sec = d.sections[0]
+    right_edge = Emu(sec.page_width - sec.left_margin - sec.right_margin)
+
+    def fix_field_tabs(p):
+        """«Срок:» ездил вправо и заезжал на новую строку, потому что в шаблоне
+        между «Ответственный: …» и «Срок: …» стоят несколько ЛИТЕРАЛЬНЫХ табов
+        по табстопам по умолчанию (0,5″): чем длиннее список ответственных, тем
+        дальше эти же табы уносят «Срок». Лечим раз и навсегда: сводим табы к
+        ОДНОМУ и ставим единственный ПРАВОВЫРАВНЕННЫЙ табстоп у правого поля —
+        тогда «Срок:» всегда прижат к правому краю независимо от длины ФИО.
+        Трогаем только строки полей, ничего больше (логотип, подпись, поля,
+        колонтитулы остаются на месте)."""
+        tab_runs = [r for r in p.runs if "\t" in r.text]
+        for r in tab_runs[1:]:
+            r.text = ""
+        if tab_runs:
+            tab_runs[0].text = "\t"
+        pPr = p._p.get_or_add_pPr()
+        for tabs in pPr.findall(qn("w:tabs")):     # убрать прежние табстопы строки
+            pPr.remove(tabs)
+        p.paragraph_format.tab_stops.add_tab_stop(right_edge, WD_TAB_ALIGNMENT.RIGHT)
 
     def find(sub):
         for p in P:
@@ -507,7 +534,9 @@ def to_docx(head, nodes, marks, tpl, out_path, today):
         put(Paragraph(e, par), f"{n['num']}. {n['text']}", mark=pr)
         if n["kind"] == "item":
             ef = copy.deepcopy((SUBF if lvl else FIELD)._element); a.addnext(ef); a = ef
-            put(Paragraph(ef, par), f"Ответственный: {n['otv']}    ", f"Срок: {n['srok']}")
+            fp = Paragraph(ef, par)
+            put(fp, f"Ответственный: {n['otv']}    ", f"Срок: {n['srok']}")
+            fix_field_tabs(fp)   # «Срок» прижимаем к правому краю, а не 8 табами
 
     b = ISP._element
     for name in people(nodes):
