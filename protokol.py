@@ -285,10 +285,11 @@ def parse(path):
         raw_deleted = m.group(1).strip()
     # Строка «Удалённые номера:» могла быть вписана вручную в блокноте и содержать
     # что угодно (мусор, «—», буквы, лишние знаки). Правило: берём из неё ТОЛЬКО
-    # целые числа; если валидных чисел нет — ведём себя так, будто строки нет
-    # вовсе. Так ошибочная ручная правка служебной строки не толкуется превратно.
-    dels = [int(x) for x in re.findall(r"\d+", raw_deleted)]
-    head["deleted"] = ", ".join(str(x) for x in sorted(set(dels), key=int)) if dels else ""
+    # корректные номера — целые «12» (удалённый пункт/раздел) и составные «1.8»
+    # (удалённый подпункт); всё прочее отбрасываем. Нет ни одного валидного —
+    # ведём себя так, будто строки нет. Составные номера нужны, чтобы удалённый
+    # подпункт (например 1.8) не выдавался заново — раньше он терялся.
+    head["deleted"] = norm_deleted(raw_deleted)
     place = ""
     for i, l in enumerate(lines):
         if l.startswith("Дата последней редакции:") and i + 1 < len(lines):
@@ -589,10 +590,12 @@ def check(head, nodes):
                 out.append(f"{n['num']}: не указан срок")
     nums = [int(n["num"].split(".")[0]) for n in nodes]
     if nums:
-        missing = sorted(set(range(1, max(nums) + 1)) - set(nums))
-        if missing and not head.get("deleted"):
+        # дыра верхнего уровня «непонятного происхождения» — только та, что не
+        # объяснена реестром удалённых ПУНКТОВ (подпункты в реестре на это не влияют)
+        missing = sorted(set(range(1, max(nums) + 1)) - set(nums) - deleted_tops(head))
+        if missing:
             out.append("дыры в нумерации: " + ", ".join(map(str, missing)) +
-                       " — строки «Удалённые номера» нет, происхождение неизвестно")
+                       " — в «Удалённых номерах» их нет, происхождение неизвестно")
     return out
 
 
@@ -604,13 +607,55 @@ def new_protocol(title, place, grif, today):
                        place.strip(), "", "```", "```", ""])
 
 
+# ---------- реестр удалённых номеров ----------
+# Хранится в строке «Удалённые номера:» вперемешку: целые «12» — удалённые
+# пункты/разделы, составные «1.8» — удалённые подпункты. Разбираем строго.
+_DEL_TOP = re.compile(r"^\d+$")
+_DEL_SUB = re.compile(r"^\d+\.\d+$")
+
+
+def _split_deleted(s):
+    tops, subs = [], []
+    for tok in re.split(r"[,\s]+", (s or "").strip()):
+        tok = tok.strip()
+        if _DEL_TOP.match(tok):
+            tops.append(int(tok))
+        elif _DEL_SUB.match(tok):
+            subs.append(tok)
+    return tops, subs
+
+
+def norm_deleted(s):
+    """Нормализованная строка реестра: сначала пункты по возрастанию, затем
+    подпункты по (родитель, индекс). Мусор отброшен, дубликаты убраны."""
+    tops, subs = _split_deleted(s)
+    tops = sorted(set(tops))
+    subs = sorted(set(subs), key=lambda x: (int(x.split(".")[0]), int(x.split(".")[1])))
+    return ", ".join([str(t) for t in tops] + subs)
+
+
+def deleted_tops(head):
+    return set(_split_deleted(head.get("deleted", ""))[0])
+
+
+def deleted_subs(head):
+    return set(_split_deleted(head.get("deleted", ""))[1])
+
+
+def add_deleted(head, num):
+    """Дописать номер (целый или составной) в реестр удалённых."""
+    cur = head.get("deleted", "") or ""
+    head["deleted"] = norm_deleted(cur + " " + str(num))
+
+
 def used_numbers(head, nodes):
+    """Занятые номера ВЕРХНЕГО уровня: действующие + удалённые пункты/разделы.
+    Составные (подпункты) сюда не входят — у них свой учёт в next_sub."""
     used = set()
     for n in nodes:
         if n["kind"] == "head": continue
         used.add(int(n["num"].split(".")[0]))
-    for x in re.findall(r"\d+", head.get("deleted", "") or ""):
-        used.add(int(x))
+    used |= deleted_tops(head)
     return used
 
 
@@ -619,9 +664,15 @@ def next_top(head, nodes):
     return (max(u) + 1) if u else 1
 
 
-def next_sub(nodes, parent):
+def next_sub(nodes, parent, head=None):
+    """Следующий свободный подпункт. Учитываем и действующие подпункты, и
+    удалённые (из реестра), чтобы удалённый номер (например 1.8) не выдавался
+    заново — даже если он был последним и после удаления ряд «просел»."""
     subs = [int(n["num"].split(".")[1]) for n in nodes
             if n["num"].startswith(parent + ".") and n["num"].count(".") == 1]
+    if head is not None:
+        subs += [int(x.split(".")[1]) for x in deleted_subs(head)
+                 if x.split(".")[0] == parent]
     return (max(subs) + 1) if subs else 1
 
 
@@ -895,7 +946,7 @@ def main():
     marks = escalate(nodes, today, moved, bump=do_bump)
     if a.cmd == "add":
         if a.parent:
-            num = f"{a.parent}.{next_sub(nodes, a.parent)}"
+            num = f"{a.parent}.{next_sub(nodes, a.parent, head)}"
             idx = pos_after(nodes, a.parent)
         else:
             num = str(next_top(head, nodes)); idx = len(nodes)
@@ -943,10 +994,20 @@ def main():
         if not gone:
             print(f"НЕТ ПУНКТА {a.num}"); return
         nodes = [n for n in nodes if n not in gone]
-        top = int(a.num.split(".")[0])
-        if "." not in a.num and top == max(used_numbers(head, nodes + gone)):
-            d = [x for x in re.findall(r"\d+", head.get("deleted", "") or "")]
-            head["deleted"] = ", ".join(sorted(set(d + [str(top)]), key=int))
+        # Реестр удалённых пополняем ТОЛЬКО когда удалён «верхний» номер своего
+        # ряда — иначе его выдали бы заново. Дыры в середине видны по документу и
+        # так не переиспользуются, их не пишем.
+        if "." not in a.num:
+            top = int(a.num)
+            if top == max(used_numbers(head, nodes + gone)):
+                add_deleted(head, top)                       # удалён последний пункт/раздел
+        else:
+            parent, idx = a.num.split(".")[0], int(a.num.split(".")[1])
+            remaining_max = max([int(n["num"].split(".")[1]) for n in nodes
+                                 if n["num"].startswith(parent + ".")
+                                 and n["num"].count(".") == 1] or [0])
+            if idx > remaining_max:
+                add_deleted(head, a.num)                      # удалён последний подпункт ряда
         # min_real для удаления: разрешаем убыль ровно на число удаляемых узлов,
         # но не больше — если удалилось бы лишнее, запись отклоняется.
         gone_real = sum(1 for n in gone if n["kind"] != "head")
